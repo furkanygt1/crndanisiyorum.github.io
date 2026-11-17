@@ -145,6 +145,9 @@ h2{font-size:20px;margin:20px 0 8px;letter-spacing:-.01em}
 .legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;background:var(--c)}
 .row-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .help{font-size:14px;color:var(--muted)}
+#saveInd{font-size:12px;color:var(--good);font-weight:600;opacity:0;transition:opacity .3s}
+#saveInd.show{opacity:1}
+.warnbox{margin-top:14px;padding:14px 16px;background:var(--warn-soft);border-color:var(--warn);font-size:14px}
 .help li{margin:4px 0}
 @media (max-width:620px){
   .brand small{display:none}
@@ -169,6 +172,7 @@ h2{font-size:20px;margin:20px 0 8px;letter-spacing:-.01em}
       <button data-deck="p">Phrasal Verbs</button>
       <button data-deck="all">Tümü</button>
     </div>
+    <span id="saveInd" aria-live="polite"></span>
     <button class="iconbtn" id="themeBtn" title="Tema değiştir" aria-label="Tema değiştir">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
     </button>
@@ -176,6 +180,11 @@ h2{font-size:20px;margin:20px 0 8px;letter-spacing:-.01em}
 </header>
 
 <main class="wrap">
+  <div id="storeWarn" class="card warnbox hidden">
+    <b>Bu tarayıcı ilerlemeyi kaydetmiyor.</b>
+    Dosya bir önizleyicide, gizli sekmede ya da depolamanın kapalı olduğu bir uygulamada açılmış olabilir.
+    Dosyayı Chrome, Safari veya Firefox ile doğrudan aç. O zamana kadar çıkmadan önce <b>İlerleme → İlerlemeyi dışa aktar</b> ile yedek al.
+  </div>
   <!-- filter shared by study/quiz/list -->
   <div class="toolbar" id="filterBar">
     <label for="rangeSel">Aralık</label>
@@ -223,16 +232,56 @@ const BOX_NAMES = ['Yeni','Bilmiyorum','Zayıf','Orta','İyi','Öğrenildi'];
 
 /* ---------- storage (safe) ---------- */
 const KEY = 'ydsKelime.v1';
+let study = null, quiz = null;          // live sessions (saved inside S.sess)
+let storageOK = false;
+try { localStorage.setItem(KEY+'.test','1'); storageOK = localStorage.getItem(KEY+'.test')==='1'; localStorage.removeItem(KEY+'.test'); } catch(e){}
 function load(){ try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch(e){ return {}; } }
 let S = load();
 S.p = S.p || {};        // progress per id: {b:box, c:correct, w:wrong, t:lastTs}
 S.star = S.star || {};
 S.ui = S.ui || {deck:'v', view:'study', range:'all', subset:'all', dir:'en', qtype:'mix', qlen:20};
-function save(){ try { localStorage.setItem(KEY, JSON.stringify(S)); } catch(e){} }
+/* sessions are stored as plain ids so they survive closing the page */
+function packSessions(){
+  S.sess = {
+    sig: S.ui.deck+'|'+S.ui.range+'|'+S.ui.subset,
+    study: study && {queue:study.queue, i:study.i, total:study.total, known:study.known, again:study.again, hard:study.hard},
+    quiz: quiz && {i: quiz.i + (quiz.answered ? 1 : 0), right:quiz.right, wrongs:quiz.wrongs,
+                   qs: quiz.qs.map(q => ({id:q.e.id, type:q.type, ch: q.choices ? q.choices.map(c=>c.id) : null}))}
+  };
+}
+function unpackSessions(){
+  const ss = S.sess;
+  if (!ss || ss.sig !== S.ui.deck+'|'+S.ui.range+'|'+S.ui.subset) return;
+  if (ss.study && ss.study.queue.every(id => BYID[id])) study = {...ss.study, flipped:false};
+  if (ss.quiz && ss.quiz.qs.every(x => BYID[x.id]))
+    quiz = {i:ss.quiz.i, right:ss.quiz.right, wrongs:ss.quiz.wrongs, answered:false,
+            qs: ss.quiz.qs.map(x => makeQuestion(BYID[x.id], x.type, x.ch))};
+}
+let saveTimer = null;
+function save(){
+  packSessions();
+  S.savedAt = Date.now();
+  const json = JSON.stringify(S);
+  try { localStorage.setItem(KEY, json); } catch(e){}
+  clearTimeout(saveTimer); saveTimer = setTimeout(() => idbPut(json), 300);   // second copy in IndexedDB
+  const ind = document.getElementById('saveInd');
+  if (ind && storageOK){ ind.textContent = '✓ Kaydedildi'; ind.classList.add('show'); clearTimeout(ind._t); ind._t = setTimeout(()=>ind.classList.remove('show'), 1200); }
+}
+/* IndexedDB backup copy: restores progress if localStorage gets wiped */
+function idb(){ return new Promise((res, rej) => { try {
+  const r = indexedDB.open('ydsKelime', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('kv');
+  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+} catch(e){ rej(e); } }); }
+function idbPut(json){ idb().then(db => { const tx = db.transaction('kv','readwrite'); tx.objectStore('kv').put(json, KEY); tx.oncomplete = () => db.close(); }).catch(()=>{}); }
+function idbGet(){ return idb().then(db => new Promise(res => { const r = db.transaction('kv').objectStore('kv').get(KEY); r.onsuccess = () => { res(r.result); db.close(); }; r.onerror = () => res(null); })).catch(() => null); }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') save(); });
+window.addEventListener('pagehide', save);
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(()=>{});
 const prog = id => S.p[id] || {b:0,c:0,w:0,t:0};
 function mark(id, ok){
   const p = {...prog(id)};
-  if (ok === true){ p.b = Math.min(MAXBOX, p.b + 1); p.c++; }
+  if (ok === true){ p.b = p.b === 0 ? 3 : Math.min(MAXBOX, p.b + 1); p.c++; }   // a new word you already know starts at 'Orta'
   else if (ok === 'hard'){ p.b = Math.max(1, Math.min(p.b, 2)); p.c++; }
   else { p.b = 1; p.w++; }
   p.t = Date.now();
@@ -326,7 +375,7 @@ function refresh(resetSessions){
   document.querySelectorAll('nav.tabs button').forEach(b => b.classList.toggle('on', b.dataset.view === S.ui.view));
   ['study','quiz','list','stats'].forEach(v => $('#view-'+v).classList.toggle('hidden', v !== S.ui.view));
   renderFilter();
-  if (resetSessions){ study = null; quiz = null; }
+  if (resetSessions){ study = null; quiz = null; save(); }
   ({study:renderStudy, quiz:renderQuiz, list:renderList, stats:renderStats})[S.ui.view]();
 }
 
@@ -340,7 +389,6 @@ function detailHTML(e){
 }
 
 /* ---------- STUDY (flashcards, Leitner) ---------- */
-let study = null;
 function newStudy(){
   // lower boxes first, then least recently seen; small shuffle inside each box
   const items = pool();
@@ -353,7 +401,7 @@ function newStudy(){
   return {queue: order.map(e=>e.id), i:0, flipped:false, total: order.length, known:0, again:0, hard:0};
 }
 function renderStudy(){
-  if (!study) study = newStudy();
+  if (!study){ study = newStudy(); save(); }
   const el = $('#view-study');
   const dirSeg = `<div class="seg" id="dirSeg">
       <button data-dir="en" class="${S.ui.dir==='en'?'on':''}">İngilizce → Türkçe</button>
@@ -373,7 +421,7 @@ function renderStudy(){
         </div>
       </div>`;
     bindDir();
-    $('#againBtn').onclick = () => { study = newStudy(); renderStudy(); };
+    $('#againBtn').onclick = () => { study = newStudy(); save(); renderStudy(); };
     $('#toQuiz').onclick = () => { S.ui.view='quiz'; save(); refresh(false); };
     return;
   }
@@ -415,7 +463,7 @@ function rate(r){
   if (r === 'yes'){ mark(id, true); study.known++; }
   else if (r === 'hard'){ mark(id, 'hard'); study.hard++; study.queue.splice(Math.min(study.queue.length, study.i + 8), 0, id); }
   else { mark(id, false); study.again++; study.queue.splice(Math.min(study.queue.length, study.i + 4), 0, id); }
-  study.i++; study.flipped = false; renderStudy();
+  study.i++; study.flipped = false; save(); renderStudy();
 }
 function bindDir(){
   document.querySelectorAll('#dirSeg button').forEach(b => b.onclick = () => { S.ui.dir = b.dataset.dir; save(); study.flipped=false; renderStudy(); });
@@ -425,7 +473,6 @@ function bindDir(){
 const QTYPES = {
   mix:'Karışık', en2tr:'Anlamı seç', tr2en:'Kelimeyi seç', syn:'Eş anlamlı', blank:'Boşluk doldur', type:'Yazarak cevapla'
 };
-let quiz = null;
 function blankSentence(ex){ return esc(ex).replace(/\*\*(.+?)\*\*/g, '<span class="blank">_____</span>'); }
 function distractors(e, k, field){
   const cands = shuffle(ALL.filter(x => x.deck === e.deck && x.id !== e.id && x[field] && norm(x[field]) !== norm(e[field])
@@ -434,7 +481,7 @@ function distractors(e, k, field){
   for (const c of cands){ if (!seen.has(norm(c[field]))){ seen.add(norm(c[field])); out.push(c); } if (out.length===k) break; }
   return out;
 }
-function makeQuestion(e, type){
+function makeQuestion(e, type, chIds){
   if (type === 'mix'){
     const opts = ['en2tr','tr2en','blank','type'];
     if (e.syn) opts.push('syn');
@@ -444,7 +491,7 @@ function makeQuestion(e, type){
   if (type === 'blank' && !e.ex) type = 'tr2en';
   if (type === 'type') return {e, type, prompt: esc(e.tr), sub:'İngilizce karşılığını yaz', answer: e.w};
   const field = type === 'en2tr' ? 'tr' : 'w';
-  const ch = shuffle([e, ...distractors(e, 3, field)]);
+  const ch = chIds ? chIds.map(id => BYID[id]).filter(Boolean) : shuffle([e, ...distractors(e, 3, field)]);
   const q = {e, type, choices: ch.map(c => ({id:c.id, label: field==='tr' ? c.tr : c.w}))};
   if (type === 'en2tr'){ q.prompt = esc(e.w); q.sub = 'Türkçe anlamı hangisi?'; }
   if (type === 'tr2en'){ q.prompt = esc(e.tr); q.sub = 'İngilizce karşılığı hangisi?'; }
@@ -485,7 +532,7 @@ function renderQuiz(){
       </div>`;
     $('#qtype').onchange = e => { S.ui.qtype = e.target.value; save(); };
     $('#qlen').onchange = e => { S.ui.qlen = +e.target.value; save(); };
-    $('#startQuiz').onclick = () => { quiz = newQuiz(); renderQuiz(); };
+    $('#startQuiz').onclick = () => { quiz = newQuiz(); save(); renderQuiz(); };
     return;
   }
   if (quiz.i >= quiz.qs.length){
@@ -500,11 +547,11 @@ function renderQuiz(){
         </div>
         ${quiz.wrongs.length ? `<div class="review-list" style="text-align:left">${quiz.wrongs.map(id=>{const e=BYID[id];return `<div class="it"><b>${esc(e.w)}</b> — ${esc(e.tr)}</div>`}).join('')}</div>`:''}
       </div>`;
-    $('#qAgain').onclick = () => { quiz = newQuiz(); renderQuiz(); };
-    $('#qSettings').onclick = () => { quiz = null; renderQuiz(); };
+    $('#qAgain').onclick = () => { quiz = newQuiz(); save(); renderQuiz(); };
+    $('#qSettings').onclick = () => { quiz = null; save(); renderQuiz(); };
     if ($('#qWrong')) $('#qWrong').onclick = () => {
       const qs = shuffle(quiz.wrongs).map(id => makeQuestion(BYID[id], S.ui.qtype));
-      quiz = {qs, i:0, right:0, answered:false, wrongs:[]}; renderQuiz();
+      quiz = {qs, i:0, right:0, answered:false, wrongs:[]}; save(); renderQuiz();
     };
     return;
   }
@@ -559,6 +606,7 @@ function answerChoice(i){
 function finish(q, ok){
   mark(q.e.id, ok);
   if (ok) quiz.right++; else quiz.wrongs.push(q.e.id);
+  save();
   const e = q.e;
   $('#fb').innerHTML = `<div class="card feedback ${ok?'ok':'no'}">
       <div style="display:flex;align-items:center;gap:8px;justify-content:space-between">
@@ -571,7 +619,7 @@ function finish(q, ok){
   $('#nextQ').focus({preventScroll:true});
   $('#fb').scrollIntoView({behavior:'smooth', block:'nearest'});
 }
-function nextQ(){ quiz.i++; quiz.answered = false; renderQuiz(); window.scrollTo({top:0}); }
+function nextQ(){ quiz.i++; quiz.answered = false; save(); renderQuiz(); window.scrollTo({top:0}); }
 
 /* ---------- LIST ---------- */
 let listQuery = '';
@@ -619,11 +667,12 @@ function renderStats(){
   el.innerHTML = block('Fiiller (200)', ALL.filter(e=>e.deck==='v')) + block('Phrasal Verbs (115)', ALL.filter(e=>e.deck==='p')) + `
     <h2>Nasıl çalışır?</h2>
     <ul class="help">
-      <li>Her kelime 0–5 arası bir <b>kutuda</b> durur. "Biliyorum" ya da doğru cevap bir üst kutuya taşır; "Bilmiyorum" ya da yanlış cevap kutu 1'e düşürür.</li>
+      <li>Her kelime 0–5 arası bir <b>kutuda</b> durur. "Biliyorum" ya da doğru cevap bir üst kutuya taşır (yeni kelimeyi ilk seferde bilirsen doğrudan "Orta"ya geçer); "Bilmiyorum" ya da yanlış cevap kutu 1'e düşürür.</li>
       <li>Kartlar ve testler önce düşük kutudaki kelimeleri getirir. Kutu 5 = öğrenildi.</li>
       <li>Klavye: <b>Boşluk</b> kartı çevirir, <b>1/2/3</b> değerlendirir; testte <b>1–4</b> veya <b>A–D</b> şık seçer, <b>Enter</b> sonraki soru.</li>
-      <li>İlerleme bu cihazdaki tarayıcıda saklanır. Başka cihaza taşımak için dışa aktar / içe aktar kullan.</li>
+      <li>İlerleme her cevaptan sonra ve sayfadan çıkarken otomatik kaydedilir; yarıda bıraktığın kart turu ve test de kaldığın yerden devam eder. Kayıt bu cihazdaki tarayıcıda durur, başka cihaza taşımak için dışa aktar / içe aktar kullan.</li>
     </ul>
+    <p class="help">${storageOK ? `Otomatik kayıt <b style="color:var(--good)">açık</b>${S.savedAt ? ' · son kayıt: ' + new Date(S.savedAt).toLocaleString('tr-TR') : ''}` : '<b style="color:var(--bad)">Otomatik kayıt bu tarayıcıda çalışmıyor</b> — dışa aktararak yedek al.'}</p>
     <div class="row-actions">
       <button class="btn" id="exportBtn">İlerlemeyi dışa aktar</button>
       <label class="btn" style="display:inline-flex;align-items:center">İçe aktar<input type="file" id="importIn" accept=".json,application/json" class="hidden"></label>
@@ -636,7 +685,7 @@ function renderStats(){
   };
   $('#importIn').onchange = ev => {
     const f = ev.target.files[0]; if (!f) return;
-    f.text().then(t => { const d = JSON.parse(t); if (!d.p) throw 0; S.p = d.p; S.star = d.star || {}; save(); refresh(true); alert('İlerleme içe aktarıldı.'); })
+    f.text().then(t => { const d = JSON.parse(t); if (!d.p) throw 0; S.p = d.p; S.star = d.star || {}; study = null; quiz = null; save(); refresh(true); alert('İlerleme içe aktarıldı.'); })
      .catch(() => alert('Dosya okunamadı.'));
   };
   $('#resetBtn').onclick = () => { if (confirm('Tüm ilerleme ve yıldızlar silinsin mi?')){ S.p = {}; S.star = {}; save(); refresh(true); } };
@@ -659,7 +708,21 @@ document.addEventListener('keydown', ev => {
   }
 });
 
+unpackSessions();
 refresh(false);
+if (!storageOK) $('#storeWarn').classList.remove('hidden');
+// if localStorage was cleared but IndexedDB still has a newer copy, bring it back
+idbGet().then(json => {
+  if (!json) { if (S.savedAt) idbPut(JSON.stringify(S)); return; }
+  let d; try { d = JSON.parse(json); } catch(e){ return; }
+  if ((d.savedAt||0) > (S.savedAt||0) && d.p){
+    S = d; S.p = S.p || {}; S.star = S.star || {};
+    study = null; quiz = null; unpackSessions();
+    try { localStorage.setItem(KEY, json); } catch(e){}
+    if (S.ui.theme) document.documentElement.dataset.theme = S.ui.theme;
+    refresh(false);
+  }
+});
 
 /* ---------- offline cache when served over http(s) ---------- */
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')){
