@@ -34,7 +34,7 @@ html,body{margin:0}
 body{background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-tap-highlight-color:transparent;min-height:100vh}
 button,input,select{font:inherit;color:inherit}
 .wrap{max-width:860px;margin:0 auto;padding:0 16px 96px}
-header.top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+header.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
 .top-in{max-width:860px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .brand{font-weight:750;letter-spacing:-.01em;font-size:17px;margin-right:auto;display:flex;align-items:center;gap:8px}
 .brand small{font-weight:500;color:var(--muted);font-size:13px}
@@ -263,9 +263,9 @@ function save(){
   S.savedAt = Date.now();
   const json = JSON.stringify(S);
   try { localStorage.setItem(KEY, json); } catch(e){}
-  clearTimeout(saveTimer); saveTimer = setTimeout(() => idbPut(json), 300);   // second copy in IndexedDB
+  clearTimeout(saveTimer); saveTimer = setTimeout(() => { idbPut(json); cloudPush(); }, 800);   // copies in IndexedDB and account
   const ind = document.getElementById('saveInd');
-  if (ind && storageOK){ ind.textContent = '✓ Kaydedildi'; ind.classList.add('show'); clearTimeout(ind._t); ind._t = setTimeout(()=>ind.classList.remove('show'), 1200); }
+  if (ind && (storageOK || cloud)){ ind.textContent = '✓ Kaydedildi'; ind.classList.add('show'); clearTimeout(ind._t); ind._t = setTimeout(()=>ind.classList.remove('show'), 1200); }
 }
 /* IndexedDB backup copy: restores progress if localStorage gets wiped */
 function idb(){ return new Promise((res, rej) => { try {
@@ -275,8 +275,53 @@ function idb(){ return new Promise((res, rej) => { try {
 } catch(e){ rej(e); } }); }
 function idbPut(json){ idb().then(db => { const tx = db.transaction('kv','readwrite'); tx.objectStore('kv').put(json, KEY); tx.oncomplete = () => db.close(); }).catch(()=>{}); }
 function idbGet(){ return idb().then(db => new Promise(res => { const r = db.transaction('kv').objectStore('kv').get(KEY); r.onsuccess = () => { res(r.result); db.close(); }; r.onerror = () => res(null); })).catch(() => null); }
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') save(); });
-window.addEventListener('pagehide', save);
+function saveNow(){ save(); clearTimeout(saveTimer); idbPut(JSON.stringify(S)); cloudPush(); }
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveNow(); });
+window.addEventListener('pagehide', saveNow);
+
+/* account sync: when opened on claude.ai the progress is kept with the viewer's account (private, every device) */
+let cloud = null, cloudBusy = false, cloudDirty = false, cloudLast = '';
+function cloudPush(){
+  if (!cloud) return;
+  const json = JSON.stringify(S);
+  if (json === cloudLast) return;
+  if (cloudBusy){ cloudDirty = true; return; }
+  cloudBusy = true;
+  cloud.set({json, savedAt: S.savedAt || Date.now()})
+    .then(() => { cloudLast = json; })
+    .catch(() => {})
+    .finally(() => { cloudBusy = false; if (cloudDirty){ cloudDirty = false; cloudPush(); } });
+}
+function adoptState(d){
+  S = d; S.p = S.p || {}; S.star = S.star || {};
+  S.ui = S.ui || {deck:'v', view:'study', range:'all', subset:'all', dir:'en', qtype:'mix', qlen:20};
+  study = null; quiz = null; unpackSessions();
+  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch(e){}
+  if (S.ui.theme) document.documentElement.dataset.theme = S.ui.theme;
+  refresh(false);
+}
+async function cloudInit(){
+  if (!window.claude || typeof window.claude.use !== 'function') return;
+  const [db, user] = await Promise.all([claude.use('db'), claude.use('user')]);
+  if (!db || !user) return;
+  const uid = await user.id();
+  if (!uid) return;
+  const ref = db.collection('data/users/' + uid).doc('progress');
+  let snap;
+  try {
+    snap = await Promise.race([ref.get(), new Promise((_, rej) => setTimeout(() => rej('timeout'), 10000))]);
+  } catch(e){ return; }
+  cloud = ref;
+  if (snap.exists){
+    const d = snap.data();
+    cloudLast = d.json;
+    let remote = null; try { remote = JSON.parse(d.json); } catch(e){}
+    if (remote && (remote.savedAt || 0) > (S.savedAt || 0)) adoptState(remote);
+  }
+  $('#storeWarn').classList.add('hidden');
+  if (S.ui.view === 'stats') renderStats();
+  cloudPush();
+}
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(()=>{});
 const prog = id => S.p[id] || {b:0,c:0,w:0,t:0};
 function mark(id, ok){
@@ -401,7 +446,7 @@ function newStudy(){
   return {queue: order.map(e=>e.id), i:0, flipped:false, total: order.length, known:0, again:0, hard:0};
 }
 function renderStudy(){
-  if (!study){ study = newStudy(); save(); }
+  if (!study) study = newStudy();   // saved with the first answer, so opening the page never overwrites a newer save
   const el = $('#view-study');
   const dirSeg = `<div class="seg" id="dirSeg">
       <button data-dir="en" class="${S.ui.dir==='en'?'on':''}">İngilizce → Türkçe</button>
@@ -672,23 +717,31 @@ function renderStats(){
       <li>Klavye: <b>Boşluk</b> kartı çevirir, <b>1/2/3</b> değerlendirir; testte <b>1–4</b> veya <b>A–D</b> şık seçer, <b>Enter</b> sonraki soru.</li>
       <li>İlerleme her cevaptan sonra ve sayfadan çıkarken otomatik kaydedilir; yarıda bıraktığın kart turu ve test de kaldığın yerden devam eder. Kayıt bu cihazdaki tarayıcıda durur, başka cihaza taşımak için dışa aktar / içe aktar kullan.</li>
     </ul>
-    <p class="help">${storageOK ? `Otomatik kayıt <b style="color:var(--good)">açık</b>${S.savedAt ? ' · son kayıt: ' + new Date(S.savedAt).toLocaleString('tr-TR') : ''}` : '<b style="color:var(--bad)">Otomatik kayıt bu tarayıcıda çalışmıyor</b> — dışa aktararak yedek al.'}</p>
+    <p class="help" id="saveStatus">${cloud ? `Otomatik kayıt <b style="color:var(--good)">açık</b>: ilerleme Claude hesabına kaydediliyor, her cihazda aynı kaldığın yerden devam edersin${S.savedAt ? ' · son kayıt: ' + new Date(S.savedAt).toLocaleString('tr-TR') : ''}` : storageOK ? `Otomatik kayıt <b style="color:var(--good)">açık</b>${S.savedAt ? ' · son kayıt: ' + new Date(S.savedAt).toLocaleString('tr-TR') : ''}` : '<b style="color:var(--bad)">Otomatik kayıt bu tarayıcıda çalışmıyor</b> — dışa aktararak yedek al.'}</p>
     <div class="row-actions">
       <button class="btn" id="exportBtn">İlerlemeyi dışa aktar</button>
       <label class="btn" style="display:inline-flex;align-items:center">İçe aktar<input type="file" id="importIn" accept=".json,application/json" class="hidden"></label>
       <button class="btn bad" id="resetBtn">İlerlemeyi sıfırla</button>
-    </div>`;
-  $('#exportBtn').onclick = () => {
-    const blob = new Blob([JSON.stringify({p:S.p, star:S.star}, null, 1)], {type:'application/json'});
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'yds-kelime-ilerleme.json'; a.click();
+    </div>
+    <p class="help" id="ioMsg" aria-live="polite"></p>`;
+  const msg = t => { $('#ioMsg').textContent = t; };
+  $('#exportBtn').onclick = async () => {
+    const data = JSON.stringify({p:S.p, star:S.star}, null, 1), filename = 'yds-kelime-ilerleme.json';
+    const dl = window.claude && typeof window.claude.use === 'function' ? await claude.use('downloads') : null;
+    if (dl){ try { await dl.save({filename, data}); msg('Yedek dosyası kaydedildi.'); } catch(e){ msg('Yedek kaydedilmedi.'); } return; }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([data], {type:'application/json'})); a.download = filename; a.click();
     setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
   };
   $('#importIn').onchange = ev => {
     const f = ev.target.files[0]; if (!f) return;
-    f.text().then(t => { const d = JSON.parse(t); if (!d.p) throw 0; S.p = d.p; S.star = d.star || {}; study = null; quiz = null; save(); refresh(true); alert('İlerleme içe aktarıldı.'); })
-     .catch(() => alert('Dosya okunamadı.'));
+    f.text().then(t => { const d = JSON.parse(t); if (!d.p) throw 0; S.p = d.p; S.star = d.star || {}; study = null; quiz = null; saveNow(); refresh(true); $('#ioMsg').textContent = 'İlerleme içe aktarıldı.'; })
+     .catch(() => msg('Dosya okunamadı. İlerleme yedeği olan .json dosyasını seç.'));
   };
-  $('#resetBtn').onclick = () => { if (confirm('Tüm ilerleme ve yıldızlar silinsin mi?')){ S.p = {}; S.star = {}; save(); refresh(true); } };
+  $('#resetBtn').onclick = ev => {
+    const b = ev.currentTarget;
+    if (!b.dataset.armed){ b.dataset.armed = '1'; b.textContent = 'Emin misin? Silmek için tekrar bas'; setTimeout(() => { if (b.isConnected){ delete b.dataset.armed; b.textContent = 'İlerlemeyi sıfırla'; } }, 4000); return; }
+    S.p = {}; S.star = {}; study = null; quiz = null; saveNow(); refresh(true);
+  };
 }
 
 /* ---------- keyboard ---------- */
@@ -715,14 +768,8 @@ if (!storageOK) $('#storeWarn').classList.remove('hidden');
 idbGet().then(json => {
   if (!json) { if (S.savedAt) idbPut(JSON.stringify(S)); return; }
   let d; try { d = JSON.parse(json); } catch(e){ return; }
-  if ((d.savedAt||0) > (S.savedAt||0) && d.p){
-    S = d; S.p = S.p || {}; S.star = S.star || {};
-    study = null; quiz = null; unpackSessions();
-    try { localStorage.setItem(KEY, json); } catch(e){}
-    if (S.ui.theme) document.documentElement.dataset.theme = S.ui.theme;
-    refresh(false);
-  }
-});
+  if ((d.savedAt||0) > (S.savedAt||0) && d.p) adoptState(d);
+}).then(cloudInit);
 
 /* ---------- offline cache when served over http(s) ---------- */
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')){
